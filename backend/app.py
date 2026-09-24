@@ -1,0 +1,1 @@
+print("MediaRing CyberGuard backend is running!")
