@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Boolean
 from database import Base
 
 
@@ -8,3 +8,4 @@ class Customer(Base):
     id = Column(Integer, primary_key=True, index=True)
     company_name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
