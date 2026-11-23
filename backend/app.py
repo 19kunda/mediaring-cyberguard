@@ -1,11 +1,22 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jwt.exceptions import InvalidTokenError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from database import SessionLocal, engine, Base
 from models import Customer
-from schemas import CustomerCreate, CustomerUpdate
+from schemas import (
+    CustomerCreate,
+    CustomerUpdate,
+    CustomerRegister,
+    CustomerLogin,
+    CustomerResponse,
+)
+
+from security import hash_password, verify_password
+from auth import create_access_token, verify_access_token
 
 app = FastAPI(title="MediaRing CyberGuard")
 Base.metadata.create_all(bind=engine)
@@ -18,7 +29,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 def get_db():
@@ -27,35 +38,86 @@ def get_db():
         yield db
     finally:
         db.close()
+# Configure Bearer token authentication.
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_customer(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    # Reject requests without an access token.
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Verify the JWT access token.
+    try:
+        payload = verify_access_token(credentials.credentials)
+        customer_id = int(payload.get("sub", ""))
+
+    except (InvalidTokenError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Find the customer associated with the token.
+    customer = db.query(Customer).filter(
+        Customer.id == customer_id
+    ).first()
+
+    # Reject missing, inactive or unconfigured accounts.
+    if (
+        customer is None
+        or not customer.is_active
+        or not customer.password_hash
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or inactive customer account.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return customer
 
 
 @app.get("/")
 def home():
     return {"message": "MediaRing CyberGuard API is running!"}
 
-
 @app.post(
-    "/customers",
-    responses={
-        409: {
-            "description": "A customer with this email address already exists."
-        }
-    }
+    "/auth/register",
+    response_model=CustomerResponse,
+    status_code=201,
 )
-def create_customer(customer: CustomerCreate, db: Session = Depends(get_db)):
+def register_customer(
+    customer_data: CustomerRegister,
+    db: Session = Depends(get_db),
+):
+    # Check whether the email address is already registered.
     existing_customer = db.query(Customer).filter(
-        Customer.email == customer.email
+        Customer.email == customer_data.email
     ).first()
 
     if existing_customer:
         raise HTTPException(
             status_code=409,
-            detail="A customer with this email address already exists."
+            detail="A customer with this email address already exists.",
         )
 
+    # Hash the password before storing it.
+    hashed_password = hash_password(customer_data.password)
+
+    # Create the new customer account.
     new_customer = Customer(
-        company_name=customer.company_name,
-        email=customer.email
+        company_name=customer_data.company_name,
+        email=customer_data.email,
+        password_hash=hashed_password,
     )
 
     db.add(new_customer)
@@ -63,170 +125,63 @@ def create_customer(customer: CustomerCreate, db: Session = Depends(get_db)):
     try:
         db.commit()
         db.refresh(new_customer)
+
     except IntegrityError:
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail="A customer with this email address already exists."
+            detail="A customer with this email address already exists.",
         )
 
+    return new_customer
+
+
+@app.post("/auth/login")
+def login_customer(
+    login_data: CustomerLogin,
+    db: Session = Depends(get_db),
+):
+    # Find the customer using their email address.
+    customer = db.query(Customer).filter(
+        Customer.email == login_data.email
+    ).first()
+
+    # Reject invalid email/password combinations.
+    if (
+        customer is None
+        or not customer.password_hash
+        or not verify_password(
+            login_data.password,
+            customer.password_hash,
+        )
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Check whether the account is active.
+    if not customer.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Generate a JWT access token.
+    access_token = create_access_token(customer.id)
+
     return {
-        "id": new_customer.id,
-        "company_name": new_customer.company_name,
-        "email": new_customer.email,
-        "is_active": new_customer.is_active
+        "access_token": access_token,
+        "token_type": "bearer",
+        "customer": CustomerResponse.model_validate(customer),
     }
-@app.get("/customers")
-def get_customers(db: Session = Depends(get_db)):
-    customers = db.query(Customer).all()
-    return customers
-
-
 @app.get(
-    "/customers/{customer_id}",
-    responses={
-        404: {
-            "description": "Customer not found."
-        }
-    }
+    "/auth/me",
+    response_model=CustomerResponse,
 )
-def get_customer(customer_id: int, db: Session = Depends(get_db)):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if customer is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer not found."
-        )
-
-    return customer
-
-
-@app.put(
-    "/customers/{customer_id}",
-    responses={
-        404: {
-            "description": "Customer not found."
-        },
-        409: {
-            "description": "A customer with this email address already exists."
-        }
-    }
-)
-def update_customer(
-    customer_id: int,
-    customer_data: CustomerUpdate,
-    db: Session = Depends(get_db)
+def get_my_account(
+    current_customer: Customer = Depends(get_current_customer),
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if customer is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer not found."
-        )
-
-    existing_customer = db.query(Customer).filter(
-        Customer.email == customer_data.email,
-        Customer.id != customer_id
-    ).first()
-
-    if existing_customer:
-        raise HTTPException(
-            status_code=409,
-            detail="A customer with this email address already exists."
-        )
-
-    customer.company_name = customer_data.company_name
-    customer.email = customer_data.email
-
-    try:
-        db.commit()
-        db.refresh(customer)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="A customer with this email address already exists."
-        )
-
-    return {
-        "id": customer.id,
-        "company_name": customer.company_name,
-        "email": customer.email,
-        "is_active": customer.is_active
-    }
-
-@app.patch(
-    "/customers/{customer_id}/deactivate",
-    responses={
-        404: {
-            "description": "Customer not found."
-        }
-    }
-)
-def deactivate_customer(
-    customer_id: int,
-    db: Session = Depends(get_db)
-):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if customer is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer not found."
-        )
-
-    customer.is_active = False
-
-    db.commit()
-    db.refresh(customer)
-
-    return {
-        "message": "Customer account deactivated successfully.",
-        "id": customer.id,
-        "company_name": customer.company_name,
-        "email": customer.email,
-        "is_active": customer.is_active
-    }
-
-@app.patch(
-    "/customers/{customer_id}/reactivate",
-    responses={
-        404: {
-            "description": "Customer not found."
-        }
-    }
-)
-def reactivate_customer(
-    customer_id: int,
-    db: Session = Depends(get_db)
-):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if customer is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer not found."
-        )
-
-    customer.is_active = True
-
-    db.commit()
-    db.refresh(customer)
-
-    return {
-        "message": "Customer account reactivated successfully.",
-        "id": customer.id,
-        "company_name": customer.company_name,
-        "email": customer.email,
-        "is_active": customer.is_active
-    }
+    return current_customer
