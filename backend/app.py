@@ -185,3 +185,29 @@ def get_my_account(
     current_customer: Customer = Depends(get_current_customer),
 ):
     return current_customer
+
+@app.put(
+    "/auth/me",
+    response_model=CustomerResponse,
+)
+def update_my_account(
+    customer_data: CustomerUpdate,
+    current_customer: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    # Update only the authenticated customer's details.
+    current_customer.company_name = customer_data.company_name
+    current_customer.email = customer_data.email
+
+    try:
+        db.commit()
+        db.refresh(current_customer)
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A customer with this email address already exists.",
+        )
+
+    return current_customer
